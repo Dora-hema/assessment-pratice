@@ -27,11 +27,8 @@ variable "gcp_service_list" {
         "sql-component.googleapis.com",
         "sqladmin.googleapis.com",
         "storage.googleapis.com",
-        "secretmanager.googleapis.com",
         "run.googleapis.com",
-        "artifactregistry.googleapis.com",
-        "redis.googleapis.com"
-    ]
+            ]
 }
 
 locals {
@@ -101,9 +98,75 @@ resource "google_compute_instance" "webapp-instance" {
   metadata_startup_script = data.startup_script_template   
   
   network_interface {
-    network = var.subnet
+    network = my-subnet_network
   }
  
+}
+
+#vpc
+resource "google_compute_network" "my-vpc_network" {
+  name                    = "my-vpc_network"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "my-subnet_network" {
+  name          = "my-subnet_network"
+  ip_cidr_range = "10.0.0.0/16"
+  region        = "us-central1"
+  network       = google_compute_network.my-vpc_network.self_link
+}
+
+resource "google_compute_router" "nat_router" {
+  name    = "my-router"
+  region  = google_compute_subnetwork.my-subnet_network.region
+  network = google_compute_network.my-vpc_network.self_link
+
+  bgp {
+    asn = 64514  #Border Gateway Protocol (BGP)
+  }
+
+  depends_on = ["google_compute_subnetwork.my-subnet_network"]
+}
+
+resource "google_compute_address" "nat_address" {
+  name = "nat_address"
+  region = "us-central1"
+}
+
+
+resource "google_compute_router_nat" "nat_subnet_rout" {
+  name   = "my-router-nat"
+  router = google_compute_router.nat_router.name
+  region = google_compute_router.nat_router.region
+
+  nat_ip_allocate_option = "MANUAL_ONLY"
+  nat_ips                = google_compute_address.nat_address.*.self_link
+
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+  subnetwork {
+    name                    = google_compute_subnetwork.my-subnet_network.self_link
+    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+  }
+}
+
+resource "google_compute_firewall" "webapp-firewall" {
+  name    = "webapp-firewall"
+  network = google_compute_network.my-vpc_network.name
+  direction = "INGRESS"
+
+  allow {
+    protocol = "icmp"
+  }
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "8080","443" "1000-2000"]
+  }
+
+}
+
+resource "google_compute_network" "default" {
+  name = "test-network"
 }
 
 resource "google_compute_instance_group" "webapp-group" {
@@ -129,7 +192,7 @@ resource "google_compute_region_health_check" "webapp-healthcheck" {
 resource "google_compute_region_backend_service" "webapp-backend_service" {
   name                  = "l7-ilb-backend-subnet"
   provider              = google-beta
-  region                = "europe-west1"
+  region                = "us-central1-a"
   protocol              = "HTTP"
   load_balancing_scheme = "INTERNAL_MANAGED"
   timeout_sec           = 10
@@ -141,12 +204,29 @@ resource "google_compute_region_backend_service" "webapp-backend_service" {
   }
 }
 
+resource "google_compute_url_map" "webapp-urlmap" {
+  name        = "webapp-urlmap"
+  description = "url map for webapp loadbalancer"
 
+  default_service = google_compute_backend_services.webapp-backend_service.self_link
+}
 
+# http proxy
+resource "google_compute_target_https_proxy" "webapp-target-https-proxy" {
+  name     = "webapp-target-https-proxy"
+  url_map  = google_compute_url_map.webapp-urlmap.self_link
+}
 
-
-
-
+# forwarding rule
+resource "google_compute_global_forwarding_rule" "webapp-https-forwarding-rule" {
+  name                  = "webapp-https-forwarding-rule"
+  region                = "us-central1-a"
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+  port_range            = "443"
+  target                = google_compute_target_http_proxy.webapp-target-https-proxy.self_link
+  ip_address            = google_compute_global_address.default.id
+}
 
 
 # Handle Database
